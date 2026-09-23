@@ -1,0 +1,16 @@
+# Keep the released frontend and runtime; rebuild only the server-side extension.
+ARG UPSTREAM_IMAGE=remnawave/subscription-page:8.0.0@sha256:04e8d479afb3598024e4018e9e15cd7fe879938250090a690ba39f1ee91b79ac
+FROM node:24.18.1-trixie-slim AS backend-build
+WORKDIR /opt/app
+COPY backend/package*.json ./
+RUN npm ci --no-audit --no-fund
+COPY backend/ ./
+RUN npm run typecheck && npm test \
+    && NODE_ENV=production npm run build && npm run trace
+
+FROM ${UPSTREAM_IMAGE}
+WORKDIR /opt/app
+RUN rm -rf ./dist
+COPY --from=backend-build /opt/app/dist ./dist
+LABEL io.out.subscription-extension="x-out.1" \
+      io.out.upstream-version="8.0.0"

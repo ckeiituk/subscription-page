@@ -1,0 +1,46 @@
+name: Check x-out
+
+on:
+  push:
+    branches: ['out/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v7
+      - name: Reject unresolved upstream conflicts
+        working-directory: .
+        run: |
+          if [ -f .github/x-out-upstream-conflict.md ]; then
+            cat .github/x-out-upstream-conflict.md
+            exit 1
+          fi
+      - name: Test upstream updater
+        working-directory: .
+        run: python3 -B -m unittest discover -s scripts -p 'test_*.py'
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24.x'
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+      - run: NODE_ENV=production npm run build
+      - run: npm run trace
+      - name: Build extension image
+        working-directory: .
+        run: docker build -f Dockerfile.x-out -t x-out-ci:test .
+      - name: Check running container
+        working-directory: .
+        run: node scripts/smoke-x-out.cjs x-out-ci:test

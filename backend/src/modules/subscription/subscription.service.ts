@@ -7,6 +7,8 @@ import { TRequestTemplateTypeKeys } from '@remnawave/backend-contract';
 
 import { AxiosService } from '@common/axios/axios.service';
 
+import { applyXOut } from './x-out';
+
 @Injectable()
 export class SubscriptionService {
     private readonly logger = new Logger(SubscriptionService.name);
@@ -38,7 +40,22 @@ export class SubscriptionService {
                 res.set(subscriptionDataResponse.headers);
             }
 
-            res.status(200).send(subscriptionDataResponse.subscription);
+            const transformed = applyXOut(subscriptionDataResponse.subscription);
+            if (transformed.warning) this.logger.warn(transformed.warning);
+            if (transformed.modified) {
+                for (const header of [
+                    'content-length',
+                    'content-encoding',
+                    'etag',
+                    'last-modified',
+                    'content-md5',
+                    'digest',
+                ]) {
+                    res.removeHeader(header);
+                }
+                res.set('Cache-Control', 'private, no-store');
+            }
+            res.status(200).send(transformed.body);
             return;
         } catch (error) {
             this.logger.error('Error in serveSubscriptionPage', error);

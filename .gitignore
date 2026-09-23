@@ -142,3 +142,7 @@ docker-compose-local.yml
 /backend/.env
 
 /frontend/public/assets/.app-config-v2.json
+/backend/.test-build/
+
+# Python updater tests
+__pycache__/
