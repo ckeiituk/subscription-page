@@ -1,5 +1,7 @@
 """Offline deployment checks, including rollback and fail-closed CI selection."""
 import importlib.util
+import hashlib
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -137,22 +139,6 @@ class DeploymentTests(unittest.TestCase):
 
 
 class RetentionTests(unittest.TestCase):
-    def test_new_builder_is_started_before_its_first_cache_prune(self):
-        bootstrapped = False
-        def run(*args, **kwargs):
-            nonlocal bootstrapped
-            if args == ("docker", "buildx", "inspect", deployer.BUILDER):
-                raise RuntimeError("No builder yet")
-            if "--bootstrap" in args:
-                bootstrapped = True
-            if "prune" in args and not bootstrapped:
-                raise RuntimeError("No such buildkit container")
-            return ""
-        with patch.object(deployer, "run", side_effect=run):
-            deployer.prepare_builder()
-            deployer.clean_build_cache()
-        self.assertTrue(bootstrapped)
-
     def test_only_obsolete_updater_images_are_removed(self):
         removed = []
         tags = ["out/subscription-page:git-current", "out/subscription-page:git-previous",
@@ -191,6 +177,60 @@ class CISelectionTests(unittest.TestCase):
     def test_latest_failure_wins_over_previous_success(self):
         newer = {**self.run, "id": 11, "conclusion": "failure"}
         self.assertEqual(deployer.latest_check([self.run, newer], "a" * 40), newer)
+
+
+class ImageDownloadTests(unittest.TestCase):
+    def setUp(self):
+        self.sha = "a" * 40
+        self.archive = b"synthetic image archive"
+        self.checksum = hashlib.sha256(self.archive).hexdigest()
+        self.url = f"https://github.com/{deployer.REPOSITORY}/releases/download/x-out-{self.sha}/"
+        self.release = {"tag_name": f"x-out-{self.sha}", "target_commitish": self.sha,
+                        "draft": False, "author": {"login": "github-actions[bot]"},
+                        "assets": [{"name": name, "browser_download_url": self.url + name,
+                                    "size": len(self.archive)}
+                                   for name in ("image.tar.gz", "image.tar.gz.sha256")]}
+
+    def responses(self, archive=None):
+        return [io.BytesIO(json.dumps(self.release).encode()),
+                io.BytesIO(f"{self.checksum}  image.tar.gz\n".encode()),
+                io.BytesIO(self.archive if archive is None else archive)]
+
+    def test_verified_image_is_loaded_and_revision_checked(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(deployer.urllib.request, "urlopen", side_effect=self.responses()), \
+             patch.object(deployer, "run", side_effect=["", self.sha]) as run:
+            image = deployer.download_image(self.sha, Path(directory))
+            self.assertEqual(image, f"out/subscription-page:git-{self.sha}")
+            self.assertEqual(run.call_args_list[0].args[:2], ("docker", "load"))
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_corrupt_archive_is_never_loaded(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(deployer.urllib.request, "urlopen", side_effect=self.responses(b"corrupt")), \
+             patch.object(deployer, "run") as run:
+            with self.assertRaisesRegex(ValueError, "checksum/size mismatch"):
+                deployer.download_image(self.sha, Path(directory))
+            run.assert_not_called()
+
+    def test_wrong_commit_or_publisher_is_rejected_before_download(self):
+        for key, value in [("target_commitish", "b" * 40), ("draft", True),
+                           ("author", {"login": "untrusted"})]:
+            release = {**self.release, key: value}
+            with tempfile.TemporaryDirectory() as directory, \
+                 patch.object(deployer.urllib.request, "urlopen", return_value=io.BytesIO(json.dumps(release).encode())) as read, \
+                 patch.object(deployer, "run") as run:
+                with self.assertRaisesRegex(ValueError, "tested commit and publisher"):
+                    deployer.download_image(self.sha, Path(directory))
+                self.assertEqual(read.call_count, 1)
+                run.assert_not_called()
+
+    def test_wrong_loaded_revision_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(deployer.urllib.request, "urlopen", side_effect=self.responses()), \
+             patch.object(deployer, "run", side_effect=["", "b" * 40]):
+            with self.assertRaisesRegex(ValueError, "revision differs"):
+                deployer.download_image(self.sha, Path(directory))
 
 
 if __name__ == "__main__":

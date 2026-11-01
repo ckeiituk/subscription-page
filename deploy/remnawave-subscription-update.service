@@ -1,5 +1,5 @@
 [Unit]
-Description=Build and deploy verified subscription-page updates
+Description=Download and deploy verified subscription-page updates
 After=docker.service network-online.target
 Wants=network-online.target
 Requires=docker.service
@@ -7,7 +7,7 @@ Requires=docker.service
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/python3 -B /usr/local/libexec/remnawave-subscription-update.py
-TimeoutStartSec=50min
+TimeoutStartSec=35min
 TimeoutStopSec=4min
 # SIGINT lets the helper restore the previous image if activation is interrupted.
 KillSignal=SIGINT

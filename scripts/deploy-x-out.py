@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -21,7 +22,6 @@ import urllib.request
 REPOSITORY = "ckeiituk/subscription-page"
 BRANCH = "out/x-out"
 SERVICE = "remnawave-subscription-page"
-BUILDER = "x-out-subscription-updates"
 
 
 def run(*args: str, cwd: Path | None = None, stdin: str | None = None,
@@ -182,21 +182,49 @@ def clean_images(previous: str | None) -> None:
                 print("An old updater image is still in use; keeping it.", flush=True)
 
 
-def prepare_builder() -> None:
-    try:
-        run("docker", "buildx", "inspect", BUILDER)
-    except RuntimeError:
-        run("docker", "buildx", "create", "--name", BUILDER, "--driver", "docker-container")
-    # docker-container builders have no daemon until explicitly bootstrapped;
-    # pruning an unstarted builder fails before the first image can be built.
-    run("docker", "buildx", "inspect", "--bootstrap", BUILDER, timeout=180)
-
-
-def clean_build_cache() -> None:
-    # This builder belongs only to the updater. Never prune the host's default
-    # builder, volumes, unrelated images, or the active/rollback runtime images.
-    run("docker", "buildx", "prune", "--builder", BUILDER, "--force", "--max-used-space", "1gb",
-        timeout=180)
+def download_image(sha: str, state_dir: Path) -> str:
+    tag = f"x-out-{sha}"
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{REPOSITORY}/releases/tags/{tag}",
+        headers={"User-Agent": "x-out-server-updater", "Accept": "application/vnd.github+json"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        release = json.load(response)
+    if (release["tag_name"] != tag or release["target_commitish"] != sha or release["draft"]
+            or release["author"]["login"] != "github-actions[bot]"):
+        raise ValueError("Release does not identify the tested commit and publisher")
+    assets = {asset["name"]: asset for asset in release["assets"]}
+    expected_base = f"https://github.com/{REPOSITORY}/releases/download/{tag}/"
+    for name in ("image.tar.gz", "image.tar.gz.sha256"):
+        if assets[name]["browser_download_url"] != expected_base + name:
+            raise ValueError("Unexpected release asset URL")
+    if not 0 < assets["image.tar.gz"]["size"] < 2 * 1024**3:
+        raise ValueError("Invalid image archive size")
+    with urllib.request.urlopen(expected_base + "image.tar.gz.sha256", timeout=30) as response:
+        checksum = response.read(4096).decode()
+    match = re.fullmatch(r"([a-f0-9]{64})  image\.tar\.gz\n?", checksum)
+    if not match:
+        raise ValueError("Invalid image checksum file")
+    with tempfile.TemporaryDirectory(prefix="image-", dir=state_dir) as directory:
+        archive = Path(directory) / "image.tar.gz"
+        digest = hashlib.sha256()
+        size = 0
+        with urllib.request.urlopen(expected_base + "image.tar.gz", timeout=60) as response, archive.open("wb") as target:
+            while block := response.read(1024 * 1024):
+                size += len(block)
+                if size > assets["image.tar.gz"]["size"]:
+                    raise ValueError("Downloaded image exceeds declared size")
+                target.write(block)
+                digest.update(block)
+        if size != assets["image.tar.gz"]["size"] or digest.hexdigest() != match[1]:
+            raise ValueError("Downloaded image checksum/size mismatch")
+        run("docker", "load", "--input", str(archive), timeout=600)
+    image = f"out/subscription-page:git-{sha}"
+    revision = run("docker", "image", "inspect", "--format",
+                   '{{index .Config.Labels "org.opencontainers.image.revision"}}', image)
+    if revision != sha:
+        raise ValueError("Loaded image revision differs from tested commit")
+    return image
 
 
 def deploy(source: Path, compose: Path, state_dir: Path, retry: bool = False) -> None:
@@ -220,21 +248,19 @@ def deploy(source: Path, compose: Path, state_dir: Path, retry: bool = False) ->
         print(f"Waiting for successful Check x-out on {sha[:12]}.", flush=True)
         return
     clean_images(state.get("previous_image"))
-    prepare_builder()
-    clean_build_cache()
     if shutil.disk_usage(source).free < 3 * 1024**3:
         raise RuntimeError("Less than 3 GiB free; current service left untouched")
     run("git", "checkout", "--detach", sha, cwd=source)
-    image = f"out/subscription-page:git-{sha}"
-    print(f"Building verified commit {sha}.", flush=True)
+    print(f"Downloading verified image for commit {sha}.", flush=True)
+    # A temporary download/API outage retries on the next poll without touching
+    # production. A corrupt release is stopped until a new commit or --retry.
     try:
-        # Keep detailed build output private; no production environment is passed.
-        with (state_dir / "build.log").open("w") as log:
-            result = subprocess.run(["docker", "buildx", "build", "--builder", BUILDER, "--load",
-                                     "-f", "Dockerfile.x-out", "-t", image, "."],
-                                    cwd=source, stdout=log, stderr=subprocess.STDOUT, timeout=1800)
-        if result.returncode:
-            raise RuntimeError("Image build failed; see private build.log")
+        image = download_image(sha, state_dir)
+    except ValueError:
+        state["failed"] = sha
+        atomic_write(state_path, json.dumps(state).encode())
+        raise
+    try:
         run("python3", "-B", "scripts/smoke-x-out.py", image, cwd=source, timeout=360)
         previous = activate(compose, state_dir, image)
     except BaseException:
@@ -244,7 +270,6 @@ def deploy(source: Path, compose: Path, state_dir: Path, retry: bool = False) ->
     atomic_write(state_path, json.dumps({"deployed": sha, "image": image,
                                         "previous_image": previous}).encode())
     clean_images(previous)
-    clean_build_cache()
     print(f"Deployed {sha[:12]} successfully.", flush=True)
 
 

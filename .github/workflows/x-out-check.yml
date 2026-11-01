@@ -47,3 +47,52 @@ jobs:
       - name: Check server-side probe launcher
         working-directory: .
         run: python3 -B scripts/smoke-x-out.py x-out-ci:test
+
+
+  publish:
+    if: github.repository == 'ckeiituk/subscription-page' && github.ref == 'refs/heads/out/x-out' && github.event_name != 'pull_request'
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and test the published image
+        env:
+          IMAGE: out/subscription-page:git-${{ github.sha }}
+        run: |
+          docker build -f Dockerfile.x-out --label "org.opencontainers.image.revision=$GITHUB_SHA" -t "$IMAGE" .
+          python3 -B scripts/smoke-x-out.py "$IMAGE"
+      - name: Publish commit image as public release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: out/subscription-page:git-${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_tag="x-out-$GITHUB_SHA"
+          verify_release() {
+            python3 -c 'import json,os; r=json.load(open("release.json")); assert r["target_commitish"] == os.environ["GITHUB_SHA"]; a={x["name"]:x for x in r["assets"]}; assert a["image.tar.gz"]["size"] > 0; assert 0 < a["image.tar.gz.sha256"]["size"] < 4096'
+          }
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$release_tag" > release.json; then
+            release_state=$(python3 -c 'import json,os; r=json.load(open("release.json")); assert r["target_commitish"] == os.environ["GITHUB_SHA"]; print("draft" if r["draft"] else "published")')
+            if [ "$release_state" = published ]; then
+              verify_release
+              echo "Complete published release already exists; assets are never overwritten."
+              exit 0
+            fi
+          else
+            printf 'Tested subscription-page image for commit %s.\n' "$GITHUB_SHA" > release-notes.txt
+            gh release create "$release_tag" --draft --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "subscription-page $GITHUB_SHA" --notes-file release-notes.txt
+          fi
+          docker save "$IMAGE" | gzip -1 > image.tar.gz
+          test "$(stat -c %s image.tar.gz)" -lt 2147483648
+          sha256sum image.tar.gz > image.tar.gz.sha256
+          # Only an unpublished draft can be repaired after a partial upload.
+          gh release upload "$release_tag" image.tar.gz image.tar.gz.sha256 \
+            --repo "$GITHUB_REPOSITORY" --clobber
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$release_tag" > release.json
+          verify_release
+          gh release edit "$release_tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest=false
