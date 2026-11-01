@@ -78,7 +78,8 @@ jobs:
           verify_release() {
             python3 -c 'import json,os; r=json.load(open("release.json")); assert r["target_commitish"] == os.environ["GITHUB_SHA"]; a={x["name"]:x for x in r["assets"]}; assert a["image.tar.gz"]["size"] > 0; assert 0 < a["image.tar.gz.sha256"]["size"] < 4096'
           }
-          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$release_tag" > release.json; then
+          if release_api=$(gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" --json apiUrl --jq .apiUrl); then
+            gh api "$release_api" > release.json
             release_state=$(python3 -c 'import json,os; r=json.load(open("release.json")); assert r["target_commitish"] == os.environ["GITHUB_SHA"]; print("draft" if r["draft"] else "published")')
             if [ "$release_state" = published ]; then
               verify_release
@@ -96,6 +97,7 @@ jobs:
           # Only an unpublished draft can be repaired after a partial upload.
           gh release upload "$release_tag" image.tar.gz image.tar.gz.sha256 \
             --repo "$GITHUB_REPOSITORY" --clobber
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$release_tag" > release.json
+          release_api=$(gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" --json apiUrl --jq .apiUrl)
+          gh api "$release_api" > release.json
           verify_release
           gh release edit "$release_tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest=false
