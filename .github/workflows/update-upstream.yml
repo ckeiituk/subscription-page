@@ -2,8 +2,12 @@ name: Update Remnawave upstream
 
 on:
   schedule:
-    - cron: '23 4 * * *'
+    - cron: '23 * * * *'
   workflow_dispatch:
+  workflow_run:
+    workflows: ['Check x-out']
+    types: [completed]
+    branches: ['out/upstream-*']
 
 permissions:
   contents: read

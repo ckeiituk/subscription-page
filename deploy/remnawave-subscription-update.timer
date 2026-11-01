@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for verified subscription-page updates every 15 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=15min
+RandomizedDelaySec=60
+Unit=remnawave-subscription-update.service
+
+[Install]
+WantedBy=timers.target
