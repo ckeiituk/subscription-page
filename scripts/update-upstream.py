@@ -1,4 +1,4 @@
-"""Open one reviewable PR per stable upstream release; never merge or deploy it."""
+"""Prepare stable upstream PRs and merge only their exact, successfully tested heads."""
 from __future__ import annotations
 
 import json
@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+import time
 
 UPSTREAM = "remnawave/subscription-page"
 CONFLICT_REPORT = Path(".github/x-out-upstream-conflict.md")
@@ -102,6 +103,7 @@ def main() -> None:
     base = os.environ["UPDATE_BASE_BRANCH"]
     if repository != "ckeiituk/subscription-page":
         raise ValueError("Updater is restricted to the configured fork")
+    keep_schedule_alive(repository, base)
     # Upstream publishes Docker images from tags, without GitHub Releases.
     tag = latest_stable_tag(output(
         "git", "ls-remote", "--tags", "--refs", f"https://github.com/{UPSTREAM}.git",
@@ -109,6 +111,7 @@ def main() -> None:
     current = current_version(Path("Dockerfile.x-out").read_text())
     if version(tag) <= version(current):
         print(f"No newer stable release: installed source {current}, latest {tag}.")
+        ensure_checks(repository, base)
         return
     branch = f"out/upstream-{tag}"
     prs = json.loads(output(
@@ -119,7 +122,7 @@ def main() -> None:
         pr = prs[0]
         print(f"Release PR already exists ({pr['state']}): {pr['url']}")
         if pr["state"] == "OPEN":
-            ensure_checks(repository, branch)
+            auto_merge_pr(repository, base, pr["number"], tag)
         return
     remote_ref = output("git", "ls-remote", "--heads", "origin", f"refs/heads/{branch}")
     if remote_ref:
@@ -146,8 +149,9 @@ def main() -> None:
            "Влиты изменения релиза и обновлены версия и digest официального образа "
            "в Dockerfile.x-out. Расширение x-out сохранено.\n\n")
         + "Workflow `Check x-out` запускается явно: тесты, TypeScript, сборка и проверка "
-        "контейнера. Перед принятием проверьте его результат и изменения upstream.\n\n"
-        "Автоматического merge, публикации образа и установки на сервер нет."
+        "контейнера. Успешно проверенный head автоматически сливается, если не меняет "
+        "наши проверки, расширение и механизм обновления. sber отдельно проверяет CI, "
+        "собирает образ и устанавливает его с проверкой и откатом."
     )
     with tempfile.NamedTemporaryFile(mode="w", suffix=".md", encoding="utf-8") as file:
         file.write(body)
@@ -157,18 +161,96 @@ def main() -> None:
         if blocked:
             args.append("--draft")
         print(output(*args))
+    # Even conflict drafts get a visible failing check; completion triggers the
+    # separate trusted updater, which applies eligibility and exact-head gates.
     ensure_checks(repository, branch)
 
 
-def ensure_checks(repository: str, branch: str) -> None:
-    # Token-created push/PR events do not guarantee an automatic CI run.
-    runs = json.loads(output(
+def check_runs(repository: str, branch: str) -> list[dict]:
+    return json.loads(output(
         "gh", "run", "list", "--repo", repository, "--workflow", "x-out-check.yml",
-        "--branch", branch, "--event", "workflow_dispatch", "--limit", "1", "--json", "databaseId",
+        "--branch", branch, "--limit", "30", "--json",
+        "databaseId,headSha,status,conclusion,event",
     ))
-    if not runs:
-        run("gh", "workflow", "run", "x-out-check.yml", "--repo", repository, "--ref", branch)
-        print(f"Started Check x-out for {branch}.")
+
+
+def keep_schedule_alive(repository: str, base: str) -> None:
+    # GitHub disables scheduled workflows in public repos after 60 days without
+    # repository activity. A monthly heartbeat keeps unattended updates alive.
+    last_commit = int(output("git", "log", "-1", "--format=%ct"))
+    if time.time() - last_commit < 30 * 86400:
+        return
+    if output("git", "status", "--porcelain"):
+        raise ValueError("Heartbeat requires a clean checkout")
+    run("git", "config", "user.name", "github-actions[bot]")
+    run("git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com")
+    heartbeat = Path(".github/x-out-updater-heartbeat")
+    heartbeat.write_text(time.strftime("%Y-%m-%d", time.gmtime()) + "\n", encoding="utf-8")
+    run("git", "add", str(heartbeat))
+    run("git", "commit", "-m", "Поддержать автоматическую проверку обновлений")
+    run("git", "push", "origin", f"HEAD:refs/heads/{base}")
+    ensure_checks(repository, base)
+
+
+def ensure_checks(repository: str, branch: str, sha: str | None = None) -> dict | None:
+    if sha is None:
+        sha = output("gh", "api", f"repos/{repository}/git/ref/heads/{branch}", "--jq", ".object.sha")
+    runs = [r for r in check_runs(repository, branch)
+            if r["headSha"] == sha and r["event"] in ("push", "workflow_dispatch")]
+    if runs:
+        return runs[0]  # A newer failure must never be hidden by an older success.
+    run("gh", "workflow", "run", "x-out-check.yml", "--repo", repository, "--ref", branch)
+    print(f"Started Check x-out for {branch} ({sha[:12]}).")
+    return None
+
+
+def protected_changes(base: str, head: str) -> list[str]:
+    paths = output("git", "diff", "--name-only", base, head, "--",
+                   ".github", "scripts", "deploy", "backend/test", "backend/tsconfig.json",
+                   "backend/tsconfig.test.json", "backend/src/modules/subscription/x-out.ts",
+                   "Dockerfile.x-out.dockerignore").splitlines()
+    # The updater may change only the pinned version/digest and version label.
+    before = output("git", "show", f"{base}:Dockerfile.x-out")
+    after = output("git", "show", f"{head}:Dockerfile.x-out")
+    normalized = pin_image(before, current_version(after),
+                           re.search(r"@(sha256:[a-f0-9]{64})", after)[1])
+    if normalized != after:
+        paths.append("Dockerfile.x-out")
+    return paths
+
+
+def auto_merge_pr(repository: str, base: str, number: int, tag: str) -> None:
+    pr = json.loads(output("gh", "pr", "view", str(number), "--repo", repository, "--json",
+                          "author,state,isDraft,isCrossRepository,headRefName,headRefOid,baseRefName,baseRefOid"))
+    if (pr["state"] != "OPEN" or pr["isDraft"] or pr["isCrossRepository"]
+            or pr["author"]["login"] not in ("app/github-actions", "github-actions[bot]")
+            or pr["headRefName"] != f"out/upstream-{tag}" or pr["baseRefName"] != base):
+        print(f"PR #{number}: manual review required; automatic merge not eligible.")
+        return
+    head = pr["headRefOid"]
+    run("git", "fetch", "origin", f"refs/heads/{base}:refs/x-out/auto-base",
+        f"refs/heads/{pr['headRefName']}:refs/x-out/auto-head")
+    if output("git", "rev-parse", "refs/x-out/auto-base") != pr["baseRefOid"] or \
+            output("git", "rev-parse", "refs/x-out/auto-head") != head:
+        raise RuntimeError("PR changed during inspection; retry next run")
+    if run("git", "merge-base", "--is-ancestor", pr["baseRefOid"], head, check=False).returncode:
+        run("gh", "api", "--method", "PUT", f"repos/{repository}/pulls/{number}/update-branch",
+            "-f", f"expected_head_sha={head}")
+        print(f"PR #{number}: refreshing base; a fresh CI run is required.")
+        return
+    changed = protected_changes(pr["baseRefOid"], head)
+    if changed:
+        print(f"PR #{number}: manual review required; protected files changed: {', '.join(changed)}")
+        return
+    result = ensure_checks(repository, pr["headRefName"], head)
+    if not result or result["status"] != "completed" or result["conclusion"] != "success":
+        print(f"PR #{number}: waiting for successful checks on {head[:12]}.")
+        return
+    # GitHub atomically rejects a changed PR head. No admin bypass or force-push.
+    run("gh", "pr", "merge", str(number), "--repo", repository, "--merge", "--match-head-commit", head)
+    print(f"Merged PR #{number} after Check x-out #{result['databaseId']}.")
+    # GITHUB_TOKEN merges do not trigger a push workflow automatically.
+    ensure_checks(repository, base)
 
 
 if __name__ == "__main__":

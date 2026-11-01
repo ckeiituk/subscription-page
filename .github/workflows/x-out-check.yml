@@ -44,3 +44,6 @@ jobs:
       - name: Check running container
         working-directory: .
         run: node scripts/smoke-x-out.cjs x-out-ci:test
+      - name: Check server-side probe launcher
+        working-directory: .
+        run: python3 -B scripts/smoke-x-out.py x-out-ci:test
