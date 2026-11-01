@@ -187,6 +187,9 @@ def prepare_builder() -> None:
         run("docker", "buildx", "inspect", BUILDER)
     except RuntimeError:
         run("docker", "buildx", "create", "--name", BUILDER, "--driver", "docker-container")
+    # docker-container builders have no daemon until explicitly bootstrapped;
+    # pruning an unstarted builder fails before the first image can be built.
+    run("docker", "buildx", "inspect", "--bootstrap", BUILDER, timeout=180)
 
 
 def clean_build_cache() -> None:

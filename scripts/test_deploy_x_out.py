@@ -137,6 +137,22 @@ class DeploymentTests(unittest.TestCase):
 
 
 class RetentionTests(unittest.TestCase):
+    def test_new_builder_is_started_before_its_first_cache_prune(self):
+        bootstrapped = False
+        def run(*args, **kwargs):
+            nonlocal bootstrapped
+            if args == ("docker", "buildx", "inspect", deployer.BUILDER):
+                raise RuntimeError("No builder yet")
+            if "--bootstrap" in args:
+                bootstrapped = True
+            if "prune" in args and not bootstrapped:
+                raise RuntimeError("No such buildkit container")
+            return ""
+        with patch.object(deployer, "run", side_effect=run):
+            deployer.prepare_builder()
+            deployer.clean_build_cache()
+        self.assertTrue(bootstrapped)
+
     def test_only_obsolete_updater_images_are_removed(self):
         removed = []
         tags = ["out/subscription-page:git-current", "out/subscription-page:git-previous",
