@@ -54,6 +54,9 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    concurrency:
+      group: x-out-publish-${{ github.sha }}
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
